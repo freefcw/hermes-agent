@@ -200,6 +200,8 @@ _DEFAULT_DEDUP_CACHE_SIZE = 2048
 _DEFAULT_WEBHOOK_HOST = "127.0.0.1"
 _DEFAULT_WEBHOOK_PORT = 8765
 _DEFAULT_WEBHOOK_PATH = "/feishu/webhook"
+_DEFAULT_WS_PING_INTERVAL = 30
+_DEFAULT_WS_PING_TIMEOUT = 10
 # ---------------------------------------------------------------------------
 # TTL, rate-limit and webhook security constants
 # ---------------------------------------------------------------------------
@@ -388,8 +390,8 @@ class FeishuAdapterSettings:
     webhook_path: str
     ws_reconnect_nonce: int = 30
     ws_reconnect_interval: int = 120
-    ws_ping_interval: Optional[int] = None
-    ws_ping_timeout: Optional[int] = None
+    ws_ping_interval: Optional[int] = _DEFAULT_WS_PING_INTERVAL
+    ws_ping_timeout: Optional[int] = _DEFAULT_WS_PING_TIMEOUT
     admins: frozenset[str] = frozenset()
     default_group_policy: str = ""
     group_rules: Dict[str, FeishuGroupRule] = field(default_factory=dict)
@@ -541,6 +543,18 @@ def _coerce_int(value: Any, default: Optional[int] = None, min_value: int = 0) -
 def _coerce_required_int(value: Any, default: int, min_value: int = 0) -> int:
     parsed = _coerce_int(value, default=default, min_value=min_value)
     return default if parsed is None else parsed
+
+
+def _coerce_optional_extra_int(
+    extra: Dict[str, Any],
+    key: str,
+    *,
+    default: Optional[int],
+    min_value: int,
+) -> Optional[int]:
+    if key in extra and extra[key] is None:
+        return None
+    return _coerce_int(extra.get(key), default=default, min_value=min_value)
 
 
 # ---------------------------------------------------------------------------
@@ -1322,8 +1336,17 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
     _apply_runtime_ws_overrides()
     try:
         ws_client.start()
-    except Exception:
-        pass
+    except Exception as exc:
+        if getattr(adapter, "_running", False):
+            logger.error("[Feishu] WS client exited with error: %s", exc, exc_info=True)
+        else:
+            logger.debug("[Feishu] WS client exited during shutdown/startup: %s", exc, exc_info=True)
+        raise
+    else:
+        if getattr(adapter, "_running", False):
+            logger.warning("[Feishu] WS client exited normally (unexpected)")
+        else:
+            logger.debug("[Feishu] WS client exited normally during shutdown/startup")
     finally:
         ws_client_module.websockets.connect = original_connect
         if original_configure is not None:
@@ -1410,6 +1433,9 @@ class FeishuAdapter(BasePlatformAdapter):
     """Feishu/Lark bot adapter."""
 
     MAX_MESSAGE_LENGTH = 8000
+    _WS_STARTUP_FAILURE_GRACE_SECONDS = 0.05
+    _WS_WATCHDOG_INTERVAL = 30
+    _WS_WATCHDOG_MAX_BACKOFF = 600
     # Max distinct chat IDs retained in _chat_locks before LRU eviction kicks in.
     CHAT_LOCK_MAX_SIZE: int = 1000
     # Threshold for detecting Feishu client-side message splits.
@@ -1429,6 +1455,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._client: Optional[Any] = None
         self._ws_client: Optional[Any] = None
         self._ws_future: Optional[asyncio.Future] = None
+        self._ws_watchdog_task: Optional[asyncio.Task] = None
         self._ws_thread_loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._webhook_runner: Optional[Any] = None
@@ -1564,8 +1591,18 @@ class FeishuAdapter(BasePlatformAdapter):
             ),
             ws_reconnect_nonce=_coerce_required_int(extra.get("ws_reconnect_nonce"), default=30, min_value=0),
             ws_reconnect_interval=_coerce_required_int(extra.get("ws_reconnect_interval"), default=120, min_value=1),
-            ws_ping_interval=_coerce_int(extra.get("ws_ping_interval"), default=None, min_value=1),
-            ws_ping_timeout=_coerce_int(extra.get("ws_ping_timeout"), default=None, min_value=1),
+            ws_ping_interval=_coerce_optional_extra_int(
+                extra,
+                "ws_ping_interval",
+                default=_DEFAULT_WS_PING_INTERVAL,
+                min_value=1,
+            ),
+            ws_ping_timeout=_coerce_optional_extra_int(
+                extra,
+                "ws_ping_timeout",
+                default=_DEFAULT_WS_PING_TIMEOUT,
+                min_value=1,
+            ),
             admins=admins,
             default_group_policy=default_group_policy,
             group_rules=group_rules,
@@ -1675,6 +1712,8 @@ class FeishuAdapter(BasePlatformAdapter):
             self._loop = asyncio.get_running_loop()
             await self._connect_with_retry()
             self._mark_connected()
+            if self._connection_mode == "websocket" and self._ws_watchdog_task is None:
+                self._ws_watchdog_task = asyncio.create_task(self._run_ws_watchdog())
             logger.info("[Feishu] Connected in %s mode (%s)", self._connection_mode, self._domain_name)
             return True
         except Exception as exc:
@@ -1687,6 +1726,11 @@ class FeishuAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         """Disconnect from Feishu/Lark."""
         self._running = False
+        if self._ws_watchdog_task is not None:
+            watchdog_task = self._ws_watchdog_task
+            self._ws_watchdog_task = None
+            watchdog_task.cancel()
+            await asyncio.gather(watchdog_task, return_exceptions=True)
         await self._cancel_pending_tasks(self._pending_text_batch_tasks)
         await self._cancel_pending_tasks(self._pending_media_batch_tasks)
         self._reset_batch_buffers()
@@ -1751,6 +1795,43 @@ class FeishuAdapter(BasePlatformAdapter):
             pass
         finally:
             self._ws_client = None
+
+    async def _run_ws_watchdog(self) -> None:
+        consecutive_failures = 0
+        while self._running:
+            await asyncio.sleep(self._WS_WATCHDOG_INTERVAL)
+            if not self._running:
+                break
+            if self._connection_mode != "websocket":
+                continue
+            if self._ws_future is not None and self._ws_future.done():
+                backoff = min(
+                    self._WS_WATCHDOG_INTERVAL * (2 ** consecutive_failures),
+                    self._WS_WATCHDOG_MAX_BACKOFF,
+                )
+                logger.warning(
+                    "[Feishu] WS thread exited unexpectedly, reconnecting (backoff=%ds)",
+                    backoff,
+                )
+                exited_future = self._ws_future
+                try:
+                    self._disable_websocket_auto_reconnect()
+                    self._ws_future = None
+                    await self._connect_with_retry()
+                    self._mark_connected()
+                    consecutive_failures = 0
+                except Exception:
+                    consecutive_failures += 1
+                    if (
+                        self._ws_watchdog_task is not None
+                        and self._ws_watchdog_task is not asyncio.current_task()
+                    ):
+                        break
+                    self._running = True
+                    if self._ws_future is None:
+                        self._ws_future = exited_future
+                    logger.error("[Feishu] WS watchdog reconnect failed", exc_info=True)
+                    await asyncio.sleep(backoff)
 
     async def _stop_webhook_server(self) -> None:
         if self._webhook_runner is None:
@@ -4520,6 +4601,50 @@ class FeishuAdapter(BasePlatformAdapter):
             self._ws_client,
             self,
         )
+
+        def _on_ws_thread_done(fut: asyncio.Future) -> None:
+            if fut.cancelled():
+                return
+            exc = fut.exception()
+            if exc:
+                if self._running:
+                    logger.error("[Feishu] WS thread failed: %s", exc)
+                else:
+                    logger.debug("[Feishu] WS thread exited during shutdown/startup: %s", exc, exc_info=True)
+            else:
+                if self._running:
+                    logger.warning("[Feishu] WS thread exited unexpectedly")
+                else:
+                    logger.debug("[Feishu] WS thread exited during shutdown/startup")
+
+        self._ws_future.add_done_callback(_on_ws_thread_done)
+        await self._raise_if_ws_thread_exited_during_startup()
+
+    async def _raise_if_ws_thread_exited_during_startup(self) -> None:
+        ws_future = self._ws_future
+        if ws_future is None:
+            return
+        try:
+            future_loop = ws_future.get_loop()
+        except AttributeError:
+            future_loop = None
+        if future_loop is not None and future_loop is not asyncio.get_running_loop():
+            return
+        try:
+            if not ws_future.done():
+                await asyncio.wait_for(
+                    asyncio.shield(ws_future),
+                    timeout=self._WS_STARTUP_FAILURE_GRACE_SECONDS,
+                )
+            else:
+                ws_future.result()
+        except asyncio.TimeoutError:
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"Feishu websocket client exited during startup: {exc}") from exc
+        raise RuntimeError("Feishu websocket client exited during startup without error")
 
     async def _connect_webhook(self) -> None:
         if not FEISHU_WEBHOOK_AVAILABLE:

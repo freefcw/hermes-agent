@@ -457,13 +457,15 @@ platforms:
   feishu:
     extra:
       ws_reconnect_interval: 120   # Seconds between reconnect attempts (default: 120)
-      ws_ping_interval: 30         # Seconds between WebSocket pings (optional; SDK default if unset)
+      ws_ping_interval: 30         # Seconds between WebSocket pings (default: 30; null = SDK default)
+      ws_ping_timeout: 10          # Seconds to wait for a ping response (default: 10; null = SDK default)
 ```
 
 | Setting | Config key | Default | Description |
 |---------|-----------|---------|-------------|
 | Reconnect interval | `ws_reconnect_interval` | 120s | How long to wait between reconnection attempts |
-| Ping interval | `ws_ping_interval` | _(SDK default)_ | Frequency of WebSocket keepalive pings |
+| Ping interval | `ws_ping_interval` | 30s | Frequency of WebSocket keepalive pings; set `null` to use the SDK default |
+| Ping timeout | `ws_ping_timeout` | 10s | How long to wait for WebSocket ping responses; set `null` to use the SDK default |
 
 ## Per-Group Access Control
 

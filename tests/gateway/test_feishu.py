@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from collections import OrderedDict
@@ -222,6 +223,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             patch("gateway.platforms.feishu.release_scoped_lock") as release_lock,
             patch.object(adapter, "_hydrate_bot_identity", new=AsyncMock()),
             patch.object(adapter, "_build_lark_client", return_value=SimpleNamespace()),
+            patch.object(adapter, "_run_ws_watchdog", new=AsyncMock()),
         ):
             _mock_event_dispatcher_builder(mock_handler_class)
 
@@ -300,6 +302,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             patch.object(adapter, "_hydrate_bot_identity", new=AsyncMock()),
             patch("gateway.platforms.feishu.asyncio.sleep", side_effect=lambda delay: sleeps.append(delay)),
             patch.object(adapter, "_build_lark_client", return_value=SimpleNamespace()),
+            patch.object(adapter, "_run_ws_watchdog", new=AsyncMock()),
         ):
             _mock_event_dispatcher_builder(mock_handler_class)
 
@@ -330,6 +333,78 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         self.assertTrue(connected)
         self.assertEqual(sleeps, [1])
         self.assertEqual(fake_loop.calls, 2)
+
+    @patch.dict(os.environ, {
+        "FEISHU_APP_ID": "cli_app",
+        "FEISHU_APP_SECRET": "secret_app",
+    }, clear=True)
+    def test_connect_fails_when_ws_thread_exits_during_startup(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        ws_client = SimpleNamespace()
+
+        def _boom(*_args, **_kwargs):
+            raise RuntimeError("websocket startup failed")
+
+        with (
+            patch("gateway.platforms.feishu.FEISHU_AVAILABLE", True),
+            patch("gateway.platforms.feishu.FEISHU_WEBSOCKET_AVAILABLE", True),
+            patch("gateway.platforms.feishu._FEISHU_CONNECT_ATTEMPTS", 1),
+            patch("gateway.platforms.feishu.lark", SimpleNamespace(LogLevel=SimpleNamespace(INFO="INFO", WARNING="WARNING"))),
+            patch("gateway.platforms.feishu.EventDispatcherHandler") as mock_handler_class,
+            patch("gateway.platforms.feishu.FeishuWSClient", return_value=ws_client),
+            patch("gateway.platforms.feishu._run_official_feishu_ws_client", side_effect=_boom),
+            patch("gateway.platforms.feishu.acquire_scoped_lock", return_value=(True, None)),
+            patch("gateway.platforms.feishu.release_scoped_lock") as release_lock,
+            patch.object(adapter, "_hydrate_bot_identity", new=AsyncMock()),
+            patch.object(adapter, "_build_lark_client", return_value=SimpleNamespace()),
+            patch.object(adapter, "_run_ws_watchdog", new=AsyncMock()),
+        ):
+            _mock_event_dispatcher_builder(mock_handler_class)
+
+            connected = asyncio.run(adapter.connect())
+
+        self.assertFalse(connected)
+        self.assertEqual(adapter.fatal_error_code, "feishu_connect_error")
+        self.assertIn("websocket client exited during startup", adapter.fatal_error_message)
+        self.assertIn("websocket startup failed", adapter.fatal_error_message)
+        release_lock.assert_called_once_with("feishu-app-id", "cli_app")
+
+    @patch.dict(os.environ, {
+        "FEISHU_APP_ID": "cli_app",
+        "FEISHU_APP_SECRET": "secret_app",
+    }, clear=True)
+    def test_connect_fails_when_ws_thread_returns_during_startup(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        ws_client = SimpleNamespace()
+
+        with (
+            patch("gateway.platforms.feishu.FEISHU_AVAILABLE", True),
+            patch("gateway.platforms.feishu.FEISHU_WEBSOCKET_AVAILABLE", True),
+            patch("gateway.platforms.feishu._FEISHU_CONNECT_ATTEMPTS", 1),
+            patch("gateway.platforms.feishu.lark", SimpleNamespace(LogLevel=SimpleNamespace(INFO="INFO", WARNING="WARNING"))),
+            patch("gateway.platforms.feishu.EventDispatcherHandler") as mock_handler_class,
+            patch("gateway.platforms.feishu.FeishuWSClient", return_value=ws_client),
+            patch("gateway.platforms.feishu._run_official_feishu_ws_client", return_value=None),
+            patch("gateway.platforms.feishu.acquire_scoped_lock", return_value=(True, None)),
+            patch("gateway.platforms.feishu.release_scoped_lock") as release_lock,
+            patch.object(adapter, "_hydrate_bot_identity", new=AsyncMock()),
+            patch.object(adapter, "_build_lark_client", return_value=SimpleNamespace()),
+            patch.object(adapter, "_run_ws_watchdog", new=AsyncMock()),
+        ):
+            _mock_event_dispatcher_builder(mock_handler_class)
+
+            connected = asyncio.run(adapter.connect())
+
+        self.assertFalse(connected)
+        self.assertEqual(adapter.fatal_error_code, "feishu_connect_error")
+        self.assertIn("without error", adapter.fatal_error_message)
+        release_lock.assert_called_once_with("feishu-app-id", "cli_app")
 
     @patch.dict(os.environ, {}, clear=True)
     def test_edit_message_updates_existing_feishu_message(self):
@@ -491,13 +566,26 @@ class TestAdapterModule(unittest.TestCase):
         self.assertEqual(settings.ws_ping_interval, 10)
         self.assertEqual(settings.ws_ping_timeout, 8)
 
-    def test_load_settings_ignores_invalid_ws_ping_values(self):
+    def test_load_settings_uses_health_check_defaults_for_invalid_ws_ping_values(self):
         from gateway.platforms.feishu import FeishuAdapter
 
         settings = FeishuAdapter._load_settings(
             {
                 "ws_ping_interval": 0,
                 "ws_ping_timeout": -1,
+            }
+        )
+
+        self.assertEqual(settings.ws_ping_interval, 30)
+        self.assertEqual(settings.ws_ping_timeout, 10)
+
+    def test_load_settings_allows_null_ws_ping_values_for_sdk_defaults(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        settings = FeishuAdapter._load_settings(
+            {
+                "ws_ping_interval": None,
+                "ws_ping_timeout": None,
             }
         )
 
@@ -549,7 +637,8 @@ class TestAdapterModule(unittest.TestCase):
         try:
             from gateway.platforms.feishu import _run_official_feishu_ws_client
 
-            _run_official_feishu_ws_client(fake_client, fake_adapter)
+            with self.assertRaises(RuntimeError):
+                _run_official_feishu_ws_client(fake_client, fake_adapter)
         finally:
             sys.modules.clear()
             sys.modules.update(original_modules)
@@ -558,6 +647,306 @@ class TestAdapterModule(unittest.TestCase):
         self.assertEqual(fake_client._reconnect_nonce, 2)
         self.assertEqual(fake_client._reconnect_interval, 3)
         self.assertEqual(fake_client._ping_interval, 4)
+
+
+class TestFeishuWSWatchdog(unittest.TestCase):
+    """Tests for WS watchdog, done callback, and exception logging."""
+
+    async def _run_watchdog_briefly(self, adapter, *, seconds=0.05):
+        adapter._WS_WATCHDOG_INTERVAL = 0.01
+        adapter._WS_WATCHDOG_MAX_BACKOFF = 0.01
+        task = asyncio.create_task(adapter._run_ws_watchdog())
+        adapter._ws_watchdog_task = task
+        await asyncio.sleep(seconds)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_watchdog_reconnects_when_ws_thread_exits(self):
+        """Watchdog should call _connect_with_retry when _ws_future is done."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._running = True
+        adapter._connection_mode = "websocket"
+
+        loop = asyncio.new_event_loop()
+        future = loop.create_future()
+        future.set_result(None)  # already done
+        adapter._ws_future = future
+
+        adapter._connect_with_retry = AsyncMock()
+        adapter._disable_websocket_auto_reconnect = Mock()
+
+        loop.run_until_complete(self._run_watchdog_briefly(adapter))
+        loop.close()
+
+        adapter._disable_websocket_auto_reconnect.assert_called_once()
+        adapter._connect_with_retry.assert_called_once()
+        self.assertTrue(adapter._running)
+        self.assertIsNone(adapter._ws_future)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_watchdog_skips_when_not_running(self):
+        """Watchdog should exit immediately when _running is False."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._running = False
+        adapter._connection_mode = "websocket"
+
+        loop = asyncio.new_event_loop()
+        future = loop.create_future()
+        future.set_result(None)
+        adapter._ws_future = future
+        adapter._connect_with_retry = AsyncMock()
+
+        loop.run_until_complete(adapter._run_ws_watchdog())
+        loop.close()
+
+        adapter._connect_with_retry.assert_not_called()
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_watchdog_noop_when_future_not_done(self):
+        """Watchdog should not trigger reconnect when WS thread is alive."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._running = True
+        adapter._connection_mode = "websocket"
+
+        loop = asyncio.new_event_loop()
+        future = loop.create_future()  # pending, not done
+        adapter._ws_future = future
+        adapter._connect_with_retry = AsyncMock()
+        adapter._disable_websocket_auto_reconnect = Mock()
+
+        loop.run_until_complete(self._run_watchdog_briefly(adapter))
+        loop.close()
+
+        adapter._connect_with_retry.assert_not_called()
+        adapter._disable_websocket_auto_reconnect.assert_not_called()
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_watchdog_backoff_on_consecutive_failures(self):
+        """Watchdog should sleep longer after consecutive reconnect failures."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._running = True
+        adapter._connection_mode = "websocket"
+
+        loop = asyncio.new_event_loop()
+        future = loop.create_future()
+        future.set_result(None)
+        adapter._ws_future = future
+        adapter._disable_websocket_auto_reconnect = Mock()
+
+        call_count = 0
+        second_failure = asyncio.Event()
+
+        async def _failing_reconnect():
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 2:
+                second_failure.set()
+            raise RuntimeError("connection failed")
+
+        adapter._connect_with_retry = _failing_reconnect
+
+        async def _run():
+            adapter._WS_WATCHDOG_INTERVAL = 0.01
+            adapter._WS_WATCHDOG_MAX_BACKOFF = 0.01
+            task = asyncio.create_task(adapter._run_ws_watchdog())
+            adapter._ws_watchdog_task = task
+            await asyncio.wait_for(second_failure.wait(), timeout=1)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        loop.run_until_complete(_run())
+        loop.close()
+
+        self.assertGreaterEqual(call_count, 2)
+        self.assertTrue(adapter._running)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_disconnect_cancels_watchdog(self):
+        """disconnect() should cancel the watchdog task."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._running = True
+
+        loop = asyncio.new_event_loop()
+
+        async def _noop():
+            await asyncio.sleep(3600)
+
+        watchdog_task = loop.create_task(_noop())
+        adapter._ws_watchdog_task = watchdog_task
+
+        adapter._disable_websocket_auto_reconnect = Mock()
+
+        loop.run_until_complete(adapter.disconnect())
+        loop.close()
+
+        self.assertTrue(watchdog_task.cancelled())
+        self.assertIsNone(adapter._ws_watchdog_task)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_ws_client_start_exception_is_logged(self):
+        """Exceptions from ws_client.start() should be logged, not swallowed."""
+        import sys
+        from types import ModuleType
+
+        class _FakeWSClient:
+            _reconnect_nonce = 30
+            _reconnect_interval = 120
+            _ping_interval = 120
+
+            def _configure(self, conf):
+                pass
+
+            def start(self):
+                raise RuntimeError("connection exploded")
+
+        fake_client = _FakeWSClient()
+        fake_adapter = SimpleNamespace(
+            _ws_thread_loop=None,
+            _ws_reconnect_nonce=30,
+            _ws_reconnect_interval=120,
+            _ws_ping_interval=None,
+            _ws_ping_timeout=None,
+            _running=True,
+        )
+        fake_client_module = ModuleType("lark_oapi.ws.client")
+        fake_client_module.loop = None
+        fake_client_module.websockets = SimpleNamespace(connect=AsyncMock())
+        fake_ws_module = ModuleType("lark_oapi.ws")
+        fake_ws_module.client = fake_client_module
+        fake_root_module = ModuleType("lark_oapi")
+        fake_root_module.ws = fake_ws_module
+
+        original_modules = sys.modules.copy()
+        sys.modules["lark_oapi"] = fake_root_module
+        sys.modules["lark_oapi.ws"] = fake_ws_module
+        sys.modules["lark_oapi.ws.client"] = fake_client_module
+        try:
+            from gateway.platforms.feishu import _run_official_feishu_ws_client
+
+            with patch("gateway.platforms.feishu.logger") as mock_logger:
+                with self.assertRaises(RuntimeError):
+                    _run_official_feishu_ws_client(fake_client, fake_adapter)
+                mock_logger.error.assert_called_once()
+                args = mock_logger.error.call_args
+                self.assertIn("WS client exited with error", args[0][0])
+        finally:
+            sys.modules.clear()
+            sys.modules.update(original_modules)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_ws_client_normal_exit_during_shutdown_is_not_warned(self):
+        """A normal WS client return during shutdown should not look like an outage."""
+        import sys
+        from types import ModuleType
+
+        class _FakeWSClient:
+            _reconnect_nonce = 30
+            _reconnect_interval = 120
+            _ping_interval = 120
+
+            def _configure(self, conf):
+                pass
+
+            def start(self):
+                return None
+
+        fake_client = _FakeWSClient()
+        fake_adapter = SimpleNamespace(
+            _ws_thread_loop=None,
+            _ws_reconnect_nonce=30,
+            _ws_reconnect_interval=120,
+            _ws_ping_interval=None,
+            _ws_ping_timeout=None,
+            _running=False,
+        )
+        fake_client_module = ModuleType("lark_oapi.ws.client")
+        fake_client_module.loop = None
+        fake_client_module.websockets = SimpleNamespace(connect=AsyncMock())
+        fake_ws_module = ModuleType("lark_oapi.ws")
+        fake_ws_module.client = fake_client_module
+        fake_root_module = ModuleType("lark_oapi")
+        fake_root_module.ws = fake_ws_module
+
+        original_modules = sys.modules.copy()
+        sys.modules["lark_oapi"] = fake_root_module
+        sys.modules["lark_oapi.ws"] = fake_ws_module
+        sys.modules["lark_oapi.ws.client"] = fake_client_module
+        try:
+            from gateway.platforms.feishu import _run_official_feishu_ws_client
+
+            with patch("gateway.platforms.feishu.logger") as mock_logger:
+                _run_official_feishu_ws_client(fake_client, fake_adapter)
+                mock_logger.warning.assert_not_called()
+                mock_logger.debug.assert_any_call("[Feishu] WS client exited normally during shutdown/startup")
+        finally:
+            sys.modules.clear()
+            sys.modules.update(original_modules)
+
+    @patch.dict(os.environ, {
+        "FEISHU_APP_ID": "cli_app",
+        "FEISHU_APP_SECRET": "secret_app",
+    }, clear=True)
+    def test_ws_done_callback_normal_exit_during_shutdown_is_not_warned(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        ws_can_exit = threading.Event()
+
+        def _blocking_ws_client(*_args, **_kwargs):
+            ws_can_exit.wait(timeout=1)
+
+        async def _run():
+            with (
+                patch("gateway.platforms.feishu.FEISHU_AVAILABLE", True),
+                patch("gateway.platforms.feishu.FEISHU_WEBSOCKET_AVAILABLE", True),
+                patch(
+                    "gateway.platforms.feishu.lark",
+                    SimpleNamespace(LogLevel=SimpleNamespace(INFO="INFO", WARNING="WARNING")),
+                ),
+                patch("gateway.platforms.feishu.EventDispatcherHandler") as mock_handler_class,
+                patch("gateway.platforms.feishu.FeishuWSClient", return_value=SimpleNamespace()),
+                patch("gateway.platforms.feishu._run_official_feishu_ws_client", side_effect=_blocking_ws_client),
+                patch("gateway.platforms.feishu.acquire_scoped_lock", return_value=(True, None)),
+                patch("gateway.platforms.feishu.release_scoped_lock"),
+                patch.object(adapter, "_hydrate_bot_identity", new=AsyncMock()),
+                patch.object(adapter, "_build_lark_client", return_value=SimpleNamespace()),
+                patch.object(adapter, "_run_ws_watchdog", new=AsyncMock()),
+                patch("gateway.platforms.feishu.logger") as mock_logger,
+            ):
+                _mock_event_dispatcher_builder(mock_handler_class)
+                self.assertTrue(await adapter.connect())
+                adapter._running = False
+                ws_can_exit.set()
+                await asyncio.wait_for(adapter._ws_future, timeout=1)
+                await asyncio.sleep(0)
+                mock_logger.warning.assert_not_called()
+                mock_logger.debug.assert_any_call("[Feishu] WS thread exited during shutdown/startup")
+                await adapter.disconnect()
+
+        asyncio.run(_run())
 
 
 def _admits_group(adapter, message, sender_id, chat_id=""):
@@ -1523,6 +1912,10 @@ class TestAdapterBehavior(unittest.TestCase):
 
         adapter = FeishuAdapter(PlatformConfig())
         adapter._on_message_event = Mock()
+        fake_web = SimpleNamespace(
+            Response=lambda *, status=200, text="": SimpleNamespace(status=status, text=text),
+            json_response=lambda _data, status=200: SimpleNamespace(status=status),
+        )
 
         body = json.dumps({
             "header": {"event_type": "im.message.receive_v1"},
@@ -1535,7 +1928,8 @@ class TestAdapterBehavior(unittest.TestCase):
             read=AsyncMock(return_value=body),
         )
 
-        response = asyncio.run(adapter._handle_webhook_request(request))
+        with patch("gateway.platforms.feishu.web", fake_web):
+            response = asyncio.run(adapter._handle_webhook_request(request))
 
         self.assertEqual(response.status, 200)
         adapter._on_message_event.assert_called_once()
@@ -1552,6 +1946,10 @@ class TestAdapterBehavior(unittest.TestCase):
         from gateway.platforms.feishu import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
+        fake_web = SimpleNamespace(
+            Response=lambda *, status=200, text="": SimpleNamespace(status=status, text=text),
+            json_response=lambda _data, status=200: SimpleNamespace(status=status),
+        )
         body = json.dumps({
             "type": "url_verification",
             "token": "wrong-token",
@@ -1564,7 +1962,8 @@ class TestAdapterBehavior(unittest.TestCase):
             read=AsyncMock(return_value=body),
         )
 
-        response = asyncio.run(adapter._handle_webhook_request(request))
+        with patch("gateway.platforms.feishu.web", fake_web):
+            response = asyncio.run(adapter._handle_webhook_request(request))
 
         self.assertEqual(response.status, 401)
 

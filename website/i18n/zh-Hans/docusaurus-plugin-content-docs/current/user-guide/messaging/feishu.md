@@ -423,13 +423,15 @@ platforms:
   feishu:
     extra:
       ws_reconnect_interval: 120   # 重连尝试间隔秒数（默认：120）
-      ws_ping_interval: 30         # WebSocket ping 间隔秒数（可选；未设置时使用 SDK 默认值）
+      ws_ping_interval: 30         # WebSocket ping 间隔秒数（默认：30；null = SDK 默认值）
+      ws_ping_timeout: 10          # 等待 ping 响应的秒数（默认：10；null = SDK 默认值）
 ```
 
 | 设置 | 配置键 | 默认值 | 说明 |
 |---------|-----------|---------|-------------|
 | 重连间隔 | `ws_reconnect_interval` | 120s | 两次重连尝试之间的等待时间 |
-| Ping 间隔 | `ws_ping_interval` | _（SDK 默认）_ | WebSocket 保活 ping 的频率 |
+| Ping 间隔 | `ws_ping_interval` | 30s | WebSocket 保活 ping 的频率；设置为 `null` 可使用 SDK 默认值 |
+| Ping 超时 | `ws_ping_timeout` | 10s | 等待 WebSocket ping 响应的时间；设置为 `null` 可使用 SDK 默认值 |
 
 ## 按群访问控制
 
