@@ -1306,6 +1306,20 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
 
     original_connect = ws_client_module.websockets.connect
     original_configure = getattr(ws_client, "_configure", None)
+    original_receive_loop = getattr(ws_client, "_receive_message_loop", None)
+
+    async def _receive_message_loop_with_failure_signal(*args: Any, **kwargs: Any) -> Any:
+        if original_receive_loop is None:
+            return None
+        try:
+            return await original_receive_loop(*args, **kwargs)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            adapter._on_ws_receive_loop_failed(exc)
+            if not loop.is_closed():
+                loop.call_soon(loop.stop)
+            return None
 
     def _apply_runtime_ws_overrides() -> None:
         try:
@@ -1333,6 +1347,8 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
     ws_client_module.websockets.connect = _connect_with_overrides
     if original_configure is not None:
         setattr(ws_client, "_configure", _configure_with_overrides)
+    if original_receive_loop is not None:
+        setattr(ws_client, "_receive_message_loop", _receive_message_loop_with_failure_signal)
     _apply_runtime_ws_overrides()
     try:
         ws_client.start()
@@ -1351,6 +1367,8 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
         ws_client_module.websockets.connect = original_connect
         if original_configure is not None:
             setattr(ws_client, "_configure", original_configure)
+        if original_receive_loop is not None:
+            setattr(ws_client, "_receive_message_loop", original_receive_loop)
         pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
         for task in pending:
             task.cancel()
@@ -1456,6 +1474,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_client: Optional[Any] = None
         self._ws_future: Optional[asyncio.Future] = None
         self._ws_watchdog_task: Optional[asyncio.Task] = None
+        self._ws_restart_task: Optional[asyncio.Task] = None
         self._ws_thread_loop: Optional[asyncio.AbstractEventLoop] = None
         self._ws_observer_lock = threading.Lock()
         self._ws_reconnecting_count = 0
@@ -1737,6 +1756,11 @@ class FeishuAdapter(BasePlatformAdapter):
             self._ws_watchdog_task = None
             watchdog_task.cancel()
             await asyncio.gather(watchdog_task, return_exceptions=True)
+        if self._ws_restart_task is not None:
+            restart_task = self._ws_restart_task
+            self._ws_restart_task = None
+            restart_task.cancel()
+            await asyncio.gather(restart_task, return_exceptions=True)
         await self._cancel_pending_tasks(self._pending_text_batch_tasks)
         await self._cancel_pending_tasks(self._pending_media_batch_tasks)
         self._reset_batch_buffers()
@@ -1817,7 +1841,7 @@ class FeishuAdapter(BasePlatformAdapter):
             self._ws_reconnecting_count += 1
             self._ws_last_reconnecting_at = time.time()
             count = self._ws_reconnecting_count
-        logger.warning("[Feishu] SDK websocket reconnecting (count=%d)", count)
+        logger.warning("[Feishu] Websocket reconnecting (count=%d)", count)
         self._write_runtime_status_safe(
             "ws_reconnecting",
             platform_state="reconnecting",
@@ -1834,15 +1858,81 @@ class FeishuAdapter(BasePlatformAdapter):
             started_at = self._ws_last_reconnecting_at
         duration = None if started_at is None else max(0.0, now - started_at)
         if duration is None:
-            logger.info("[Feishu] SDK websocket reconnected (count=%d)", count)
+            logger.info("[Feishu] Websocket reconnected (count=%d)", count)
         else:
-            logger.info("[Feishu] SDK websocket reconnected (count=%d, duration=%.2fs)", count, duration)
+            logger.info("[Feishu] Websocket reconnected (count=%d, duration=%.2fs)", count, duration)
         self._write_runtime_status_safe(
             "ws_reconnected",
             platform_state="connected",
             error_code=None,
             error_message=None,
         )
+
+    def _on_ws_receive_loop_failed(self, exc: BaseException) -> None:
+        logger.warning("[Feishu] Websocket receive loop failed; rebuilding client: %s", exc)
+
+    def _schedule_ws_restart_from_done(self, exited_future: asyncio.Future) -> None:
+        if not self._running or self._connection_mode != "websocket":
+            return
+        if self._ws_future is not exited_future:
+            return
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        restart_task = self._ws_restart_task
+        if restart_task is not None and not restart_task.done():
+            return
+        self._ws_restart_task = loop.create_task(
+            self._restart_websocket_after_thread_exit(exited_future, source="done callback")
+        )
+        self._ws_restart_task.add_done_callback(self._clear_ws_restart_task)
+
+    def _clear_ws_restart_task(self, task: asyncio.Task) -> None:
+        if self._ws_restart_task is task:
+            self._ws_restart_task = None
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.error("[Feishu] WS restart task failed unexpectedly", exc_info=True)
+
+    async def _restart_websocket_after_thread_exit(self, exited_future: asyncio.Future, *, source: str) -> bool:
+        if not self._running or self._connection_mode != "websocket":
+            return False
+        if self._ws_future is not exited_future:
+            return False
+        logger.warning("[Feishu] WS thread exited unexpectedly, reconnecting now (source=%s)", source)
+        try:
+            self._on_ws_reconnecting()
+            self._disable_websocket_auto_reconnect()
+            self._ws_future = None
+            await self._connect_with_retry()
+            self._on_ws_reconnected()
+            self._mark_connected()
+            return True
+        except Exception:
+            self._running = True
+            if self._ws_future is None:
+                self._ws_future = exited_future
+            logger.error("[Feishu] WS %s reconnect failed", source, exc_info=True)
+            return False
+
+    def _handle_ws_thread_done(self, fut: asyncio.Future) -> None:
+        if fut.cancelled():
+            return
+        exc = fut.exception()
+        if exc:
+            if self._running:
+                logger.error("[Feishu] WS thread failed: %s", exc)
+            else:
+                logger.debug("[Feishu] WS thread exited during shutdown/startup: %s", exc, exc_info=True)
+        else:
+            if self._running:
+                logger.warning("[Feishu] WS thread exited unexpectedly")
+            else:
+                logger.debug("[Feishu] WS thread exited during shutdown/startup")
+        self._schedule_ws_restart_from_done(fut)
 
     async def _run_ws_watchdog(self) -> None:
         consecutive_failures = 0
@@ -1853,6 +1943,9 @@ class FeishuAdapter(BasePlatformAdapter):
             if self._connection_mode != "websocket":
                 continue
             if self._ws_future is not None and self._ws_future.done():
+                restart_task = self._ws_restart_task
+                if restart_task is not None and not restart_task.done():
+                    continue
                 backoff = min(
                     self._WS_WATCHDOG_INTERVAL * (2 ** consecutive_failures),
                     self._WS_WATCHDOG_MAX_BACKOFF,
@@ -1862,23 +1955,15 @@ class FeishuAdapter(BasePlatformAdapter):
                     backoff,
                 )
                 exited_future = self._ws_future
-                try:
-                    self._disable_websocket_auto_reconnect()
-                    self._ws_future = None
-                    await self._connect_with_retry()
-                    self._mark_connected()
+                if await self._restart_websocket_after_thread_exit(exited_future, source="watchdog"):
                     consecutive_failures = 0
-                except Exception:
+                else:
                     consecutive_failures += 1
                     if (
                         self._ws_watchdog_task is not None
                         and self._ws_watchdog_task is not asyncio.current_task()
                     ):
                         break
-                    self._running = True
-                    if self._ws_future is None:
-                        self._ws_future = exited_future
-                    logger.error("[Feishu] WS watchdog reconnect failed", exc_info=True)
                     await asyncio.sleep(backoff)
 
     async def _stop_webhook_server(self) -> None:
@@ -4781,6 +4866,7 @@ class FeishuAdapter(BasePlatformAdapter):
             log_level=lark.LogLevel.INFO,
             event_handler=self._event_handler,
             domain=domain,
+            auto_reconnect=False,
         )
         self._install_ws_observer_hooks(self._ws_client)
         self._ws_future = loop.run_in_executor(
@@ -4789,23 +4875,7 @@ class FeishuAdapter(BasePlatformAdapter):
             self._ws_client,
             self,
         )
-
-        def _on_ws_thread_done(fut: asyncio.Future) -> None:
-            if fut.cancelled():
-                return
-            exc = fut.exception()
-            if exc:
-                if self._running:
-                    logger.error("[Feishu] WS thread failed: %s", exc)
-                else:
-                    logger.debug("[Feishu] WS thread exited during shutdown/startup: %s", exc, exc_info=True)
-            else:
-                if self._running:
-                    logger.warning("[Feishu] WS thread exited unexpectedly")
-                else:
-                    logger.debug("[Feishu] WS thread exited during shutdown/startup")
-
-        self._ws_future.add_done_callback(_on_ws_thread_done)
+        self._ws_future.add_done_callback(self._handle_ws_thread_done)
         await self._raise_if_ws_thread_exited_during_startup()
 
     async def _raise_if_ws_thread_exited_during_startup(self) -> None:

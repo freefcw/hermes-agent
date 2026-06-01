@@ -680,6 +680,61 @@ class TestAdapterModule(unittest.TestCase):
         self.assertEqual(fake_client._reconnect_interval, 3)
         self.assertEqual(fake_client._ping_interval, 4)
 
+    def test_receive_loop_failure_stops_ws_runner(self):
+        """Receive-loop failures should make the SDK runner exit for Hermes to rebuild."""
+        import sys
+        from types import ModuleType
+
+        receive_error = RuntimeError("receive exploded")
+
+        class _FakeWSClient:
+            _reconnect_nonce = 30
+            _reconnect_interval = 120
+            _ping_interval = 120
+
+            async def _receive_message_loop(self):
+                raise receive_error
+
+            def start(self):
+                import lark_oapi.ws.client as client_module
+
+                client_module.loop.create_task(self._receive_message_loop())
+                client_module.loop.run_until_complete(asyncio.sleep(3600))
+
+        fake_client = _FakeWSClient()
+        fake_adapter = SimpleNamespace(
+            _ws_thread_loop=None,
+            _ws_reconnect_nonce=30,
+            _ws_reconnect_interval=120,
+            _ws_ping_interval=None,
+            _ws_ping_timeout=None,
+            _running=True,
+            _on_ws_receive_loop_failed=Mock(),
+        )
+
+        fake_client_module = ModuleType("lark_oapi.ws.client")
+        fake_client_module.loop = None
+        fake_client_module.websockets = SimpleNamespace(connect=AsyncMock())
+        fake_ws_module = ModuleType("lark_oapi.ws")
+        fake_ws_module.client = fake_client_module
+        fake_root_module = ModuleType("lark_oapi")
+        fake_root_module.ws = fake_ws_module
+        original_modules = sys.modules.copy()
+        sys.modules["lark_oapi"] = fake_root_module
+        sys.modules["lark_oapi.ws"] = fake_ws_module
+        sys.modules["lark_oapi.ws.client"] = fake_client_module
+        try:
+            from gateway.platforms.feishu import _run_official_feishu_ws_client
+
+            with self.assertRaises(RuntimeError) as ctx:
+                _run_official_feishu_ws_client(fake_client, fake_adapter)
+        finally:
+            sys.modules.clear()
+            sys.modules.update(original_modules)
+
+        self.assertIn("Event loop stopped", str(ctx.exception))
+        fake_adapter._on_ws_receive_loop_failed.assert_called_once_with(receive_error)
+
 
 class TestFeishuWSWatchdog(unittest.TestCase):
     """Tests for WS watchdog, done callback, and exception logging."""
@@ -697,7 +752,7 @@ class TestFeishuWSWatchdog(unittest.TestCase):
             pass
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_sdk_reconnect_observer_hooks_update_runtime_status(self):
+    def test_ws_observer_hooks_update_runtime_status(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
@@ -706,7 +761,6 @@ class TestFeishuWSWatchdog(unittest.TestCase):
         ws_client = SimpleNamespace(on_reconnecting=None, on_reconnected=None)
 
         adapter._install_ws_observer_hooks(ws_client)
-
         ws_client.on_reconnecting()
         ws_client.on_reconnected()
 
@@ -752,6 +806,41 @@ class TestFeishuWSWatchdog(unittest.TestCase):
         adapter._connect_with_retry.assert_called_once()
         self.assertTrue(adapter._running)
         self.assertIsNone(adapter._ws_future)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_ws_done_callback_schedules_immediate_reconnect(self):
+        """The done callback should restart immediately instead of waiting for watchdog."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+
+        async def _run():
+            loop = asyncio.get_running_loop()
+            future = loop.create_future()
+            future.set_exception(RuntimeError("thread died"))
+            adapter._running = True
+            adapter._connection_mode = "websocket"
+            adapter._loop = loop
+            adapter._ws_future = future
+            adapter._disable_websocket_auto_reconnect = Mock()
+            adapter._connect_with_retry = AsyncMock()
+            adapter._on_ws_reconnecting = Mock()
+            adapter._on_ws_reconnected = Mock()
+            adapter._mark_connected = Mock()
+
+            adapter._handle_ws_thread_done(future)
+            task = adapter._ws_restart_task
+            self.assertIsNotNone(task)
+            await task
+
+        asyncio.run(_run())
+
+        adapter._disable_websocket_auto_reconnect.assert_called_once()
+        adapter._connect_with_retry.assert_awaited_once()
+        adapter._on_ws_reconnecting.assert_called_once()
+        adapter._on_ws_reconnected.assert_called_once()
+        adapter._mark_connected.assert_called_once()
 
     @patch.dict(os.environ, {}, clear=True)
     def test_watchdog_skips_when_not_running(self):
