@@ -161,6 +161,38 @@ class TestFeishuMessageNormalization(unittest.TestCase):
         )
 
 
+class TestSenderNameFieldSummary(unittest.TestCase):
+    def test_contact_user_field_summary_lists_names_without_values(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        response = SimpleNamespace(
+            data=SimpleNamespace(
+                user=SimpleNamespace(
+                    name="",
+                    display_name=None,
+                    open_id="ou_user",
+                    department_ids=["od_engineering"],
+                    empty_list=[],
+                )
+            )
+        )
+
+        summary = FeishuAdapter._contact_user_field_summary(response)
+
+        self.assertEqual(
+            summary,
+            "present=[department_ids,display_name,empty_list,name,open_id], "
+            "non_empty=[department_ids,open_id]",
+        )
+
+    def test_contact_user_field_summary_reports_missing_user(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        response = SimpleNamespace(data=SimpleNamespace(user=None))
+
+        self.assertEqual(FeishuAdapter._contact_user_field_summary(response), "user=<missing>")
+
+
 class TestFeishuAdapterMessaging(unittest.TestCase):
     @patch.dict(os.environ, {
         "FEISHU_APP_ID": "cli_app",

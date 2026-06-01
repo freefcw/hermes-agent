@@ -4090,8 +4090,9 @@ class FeishuAdapter(BasePlatformAdapter):
             self._log_sender_name_warning_once(
                 "contact_empty_name",
                 sender_id,
-                "[Feishu] Sender name lookup returned no usable name for %s via contact API",
+                "[Feishu] Sender name lookup returned no usable name for %s via contact API; user_fields=%s",
                 sender_id,
+                self._contact_user_field_summary(response),
             )
         except Exception:
             self._log_sender_name_warning_once(
@@ -4119,6 +4120,47 @@ class FeishuAdapter(BasePlatformAdapter):
             if isinstance(value, str) and value.strip():
                 return value.strip()
         return None
+
+    @staticmethod
+    def _contact_user_field_summary(response: Any) -> str:
+        user = getattr(getattr(response, "data", None), "user", None)
+        if user is None:
+            return "user=<missing>"
+        present, non_empty = FeishuAdapter._object_field_names(user)
+        return (
+            f"present=[{','.join(present) or '-'}], "
+            f"non_empty=[{','.join(non_empty) or '-'}]"
+        )
+
+    @staticmethod
+    def _object_field_names(value: Any) -> tuple[List[str], List[str]]:
+        if isinstance(value, dict):
+            items = value.items()
+        else:
+            try:
+                items = vars(value).items()
+            except TypeError:
+                items = []
+        present = set()
+        non_empty = set()
+        for raw_name, field_value in items:
+            name = str(raw_name).lstrip("_")
+            if not name or name.startswith("__") or callable(field_value):
+                continue
+            present.add(name)
+            if FeishuAdapter._has_non_empty_field_value(field_value):
+                non_empty.add(name)
+        return sorted(present), sorted(non_empty)
+
+    @staticmethod
+    def _has_non_empty_field_value(value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, str):
+            return bool(value.strip())
+        if isinstance(value, (list, tuple, set, dict)):
+            return bool(value)
+        return True
 
     async def _fetch_bot_names(self, bot_ids: List[str]) -> Optional[Dict[str, str]]:
         if not self._client or not bot_ids:
