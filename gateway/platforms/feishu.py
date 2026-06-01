@@ -1457,6 +1457,11 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_future: Optional[asyncio.Future] = None
         self._ws_watchdog_task: Optional[asyncio.Task] = None
         self._ws_thread_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._ws_observer_lock = threading.Lock()
+        self._ws_reconnecting_count = 0
+        self._ws_reconnected_count = 0
+        self._ws_last_reconnecting_at: Optional[float] = None
+        self._ws_last_reconnected_at: Optional[float] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._webhook_runner: Optional[Any] = None
         self._webhook_site: Optional[Any] = None
@@ -1795,6 +1800,48 @@ class FeishuAdapter(BasePlatformAdapter):
             pass
         finally:
             self._ws_client = None
+
+    def _install_ws_observer_hooks(self, ws_client: Any) -> None:
+        if not hasattr(ws_client, "on_reconnecting") or not hasattr(ws_client, "on_reconnected"):
+            logger.debug("[Feishu] lark-oapi websocket reconnect observer hooks are not available")
+            return
+        try:
+            ws_client.on_reconnecting = self._on_ws_reconnecting
+            ws_client.on_reconnected = self._on_ws_reconnected
+        except Exception:
+            logger.debug("[Feishu] Failed to install websocket reconnect observer hooks", exc_info=True)
+
+    def _on_ws_reconnecting(self, *_args: Any, **_kwargs: Any) -> None:
+        with self._ws_observer_lock:
+            self._ws_reconnecting_count += 1
+            self._ws_last_reconnecting_at = time.time()
+            count = self._ws_reconnecting_count
+        logger.warning("[Feishu] SDK websocket reconnecting (count=%d)", count)
+        self._write_runtime_status_safe(
+            "ws_reconnecting",
+            platform_state="reconnecting",
+            error_code="feishu_ws_reconnecting",
+            error_message=None,
+        )
+
+    def _on_ws_reconnected(self, *_args: Any, **_kwargs: Any) -> None:
+        now = time.time()
+        with self._ws_observer_lock:
+            self._ws_reconnected_count += 1
+            self._ws_last_reconnected_at = now
+            count = self._ws_reconnected_count
+            started_at = self._ws_last_reconnecting_at
+        duration = None if started_at is None else max(0.0, now - started_at)
+        if duration is None:
+            logger.info("[Feishu] SDK websocket reconnected (count=%d)", count)
+        else:
+            logger.info("[Feishu] SDK websocket reconnected (count=%d, duration=%.2fs)", count, duration)
+        self._write_runtime_status_safe(
+            "ws_reconnected",
+            platform_state="connected",
+            error_code=None,
+            error_message=None,
+        )
 
     async def _run_ws_watchdog(self) -> None:
         consecutive_failures = 0
@@ -4595,6 +4642,7 @@ class FeishuAdapter(BasePlatformAdapter):
             event_handler=self._event_handler,
             domain=domain,
         )
+        self._install_ws_observer_hooks(self._ws_client)
         self._ws_future = loop.run_in_executor(
             None,
             _run_official_feishu_ws_client,

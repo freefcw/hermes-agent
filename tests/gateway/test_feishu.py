@@ -665,6 +665,37 @@ class TestFeishuWSWatchdog(unittest.TestCase):
             pass
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_sdk_reconnect_observer_hooks_update_runtime_status(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._write_runtime_status_safe = Mock()
+        ws_client = SimpleNamespace(on_reconnecting=None, on_reconnected=None)
+
+        adapter._install_ws_observer_hooks(ws_client)
+
+        ws_client.on_reconnecting()
+        ws_client.on_reconnected()
+
+        self.assertEqual(adapter._ws_reconnecting_count, 1)
+        self.assertEqual(adapter._ws_reconnected_count, 1)
+        self.assertIsNotNone(adapter._ws_last_reconnecting_at)
+        self.assertIsNotNone(adapter._ws_last_reconnected_at)
+        adapter._write_runtime_status_safe.assert_any_call(
+            "ws_reconnecting",
+            platform_state="reconnecting",
+            error_code="feishu_ws_reconnecting",
+            error_message=None,
+        )
+        adapter._write_runtime_status_safe.assert_any_call(
+            "ws_reconnected",
+            platform_state="connected",
+            error_code=None,
+            error_message=None,
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_watchdog_reconnects_when_ws_thread_exits(self):
         """Watchdog should call _connect_with_retry when _ws_future is done."""
         from gateway.config import PlatformConfig
