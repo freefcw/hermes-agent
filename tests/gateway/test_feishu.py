@@ -3877,6 +3877,43 @@ class TestSenderNameResolution(unittest.TestCase):
         self.assertIn("ou_bob", adapter._sender_name_cache)
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_contact_api_failure_logs_warning_once(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        mock_response = SimpleNamespace(
+            success=lambda: False,
+            code=99991663,
+            msg="permission denied",
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        class _ContactAPI:
+            def get(self, request):
+                return mock_response
+
+        adapter._client = SimpleNamespace(
+            contact=SimpleNamespace(v3=SimpleNamespace(user=_ContactAPI()))
+        )
+
+        with (
+            patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct),
+            self.assertLogs("gateway.platforms.feishu", level="WARNING") as logs,
+        ):
+            first = asyncio.run(adapter._resolve_sender_name_from_api("ou_bob"))
+            second = asyncio.run(adapter._resolve_sender_name_from_api("ou_bob"))
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        joined = "\n".join(logs.output)
+        self.assertIn("Sender name lookup failed for ou_bob via contact API", joined)
+        self.assertIn("permission denied", joined)
+        self.assertEqual(len(logs.output), 1)
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_expired_cache_triggers_new_api_call(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
@@ -3921,10 +3958,14 @@ class TestSenderNameResolution(unittest.TestCase):
         async def _direct(func, *args, **kwargs):
             return func(*args, **kwargs)
 
-        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+        with (
+            patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct),
+            self.assertLogs("gateway.platforms.feishu", level="WARNING") as logs,
+        ):
             result = asyncio.run(adapter._resolve_sender_name_from_api("ou_broken"))
 
         self.assertIsNone(result)
+        self.assertIn("Failed to resolve sender name for ou_broken", "\n".join(logs.output))
 
 
 @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
@@ -4051,11 +4092,17 @@ class TestBotNameResolution(unittest.TestCase):
         async def _direct(func, *args, **kwargs):
             return func(*args, **kwargs)
 
-        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+        with (
+            patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct),
+            self.assertLogs("gateway.platforms.feishu", level="WARNING") as logs,
+        ):
             result = asyncio.run(adapter._resolve_sender_name_from_api("ou_peer", is_bot=True))
 
         self.assertIsNone(result)
         self.assertNotIn("ou_peer", adapter._sender_name_cache)
+        joined = "\n".join(logs.output)
+        self.assertIn("Bot name lookup failed for ou_peer", joined)
+        self.assertIn("permission denied", joined)
 
 
 @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")

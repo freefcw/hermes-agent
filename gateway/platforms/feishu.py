@@ -1471,6 +1471,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._dedup_state_path = get_hermes_home() / "feishu_seen_message_ids.json"
         self._dedup_lock = threading.Lock()
         self._sender_name_cache: Dict[str, tuple[str, float]] = {}  # sender_id → (name, expire_at)
+        self._sender_name_warning_keys: set[tuple[str, str]] = set()
         self._webhook_rate_counts: Dict[str, tuple[int, float]] = {}  # rate_key → (count, window_start)
         self._webhook_anomaly_counts: Dict[str, tuple[int, str, float]] = {}  # ip → (count, last_status, first_seen)
         self._card_action_tokens: Dict[str, float] = {}  # token → first_seen_time
@@ -4000,59 +4001,123 @@ class FeishuAdapter(BasePlatformAdapter):
         self._sender_name_cache.pop(sender_id, None)
         return None
 
+    def _log_sender_name_warning_once(
+        self,
+        reason_key: str,
+        sender_id: str,
+        log_template: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        key = (reason_key, sender_id)
+        if key in self._sender_name_warning_keys:
+            logger.debug(log_template, *args, **kwargs)
+            return
+        self._sender_name_warning_keys.add(key)
+        logger.warning(
+            f"{log_template} (further occurrences for this sender/reason at debug level)",
+            *args,
+            **kwargs,
+        )
+
+    def _cache_sender_names(self, names: Dict[str, str], expire_at: float) -> None:
+        for sender_id, name in names.items():
+            self._sender_name_cache[sender_id] = (name, expire_at)
+
     async def _resolve_sender_name_from_api(
         self,
         sender_id: Optional[str],
         *,
         is_bot: bool = False,
     ) -> Optional[str]:
-        """Bots divert to bot/basic_batch — contact API doesn't return bot names.
-        Failures are silent so the pipeline never blocks on name resolution.
-        """
+        """Resolve sender display name without blocking inbound delivery on failures."""
         if not sender_id or not self._client:
             return None
-        trimmed = sender_id.strip()
-        if not trimmed:
+        lookup_id = sender_id.strip()
+        if not lookup_id:
             return None
-        now = time.time()
-        cached_name = self._get_cached_sender_name(trimmed)
+        cached_name = self._get_cached_sender_name(lookup_id)
         if cached_name is not None:
             return cached_name or None  # "" cached means "known nameless"
+        now = time.time()
         if is_bot:
-            names = await self._fetch_bot_names([trimmed])
-            if names is None:
-                return None
-            expire_at = now + _FEISHU_SENDER_NAME_TTL_SECONDS
-            for oid, name in names.items():
-                self._sender_name_cache[oid] = (name, expire_at)
-            hit = self._sender_name_cache.get(trimmed)
-            return (hit[0] or None) if hit else None
+            return await self._resolve_bot_sender_name(lookup_id, now)
+        return await self._resolve_contact_sender_name(lookup_id, now)
+
+    async def _resolve_bot_sender_name(self, bot_id: str, now: float) -> Optional[str]:
+        names = await self._fetch_bot_names([bot_id])
+        if names is None:
+            return None
+        self._cache_sender_names(names, now + _FEISHU_SENDER_NAME_TTL_SECONDS)
+        hit = self._sender_name_cache.get(bot_id)
+        return (hit[0] or None) if hit else None
+
+    async def _resolve_contact_sender_name(self, sender_id: str, now: float) -> Optional[str]:
         try:
             from lark_oapi.api.contact.v3 import GetUserRequest  # lazy import
-            if trimmed.startswith("ou_"):
-                id_type = "open_id"
-            elif trimmed.startswith("on_"):
-                id_type = "union_id"
-            else:
-                id_type = "user_id"
-            request = GetUserRequest.builder().user_id(trimmed).user_id_type(id_type).build()
-            response = await asyncio.to_thread(self._client.contact.v3.user.get, request)
-            if not response or not response.success():
-                return None
-            user = getattr(getattr(response, "data", None), "user", None)
-            name = (
-                getattr(user, "name", None)
-                or getattr(user, "display_name", None)
-                or getattr(user, "nickname", None)
-                or getattr(user, "en_name", None)
+
+            request = (
+                GetUserRequest.builder()
+                .user_id(sender_id)
+                .user_id_type(self._contact_user_id_type(sender_id))
+                .build()
             )
-            if name and isinstance(name, str):
-                name = name.strip()
-                if name:
-                    self._sender_name_cache[trimmed] = (name, now + _FEISHU_SENDER_NAME_TTL_SECONDS)
-                    return name
+            response = await asyncio.to_thread(self._client.contact.v3.user.get, request)
+            if not response:
+                self._log_sender_name_warning_once(
+                    "contact_no_response",
+                    sender_id,
+                    "[Feishu] Sender name lookup returned no response for %s via contact API",
+                    sender_id,
+                )
+                return None
+            if not response.success():
+                code = getattr(response, "code", "unknown")
+                msg = getattr(response, "msg", "unknown")
+                self._log_sender_name_warning_once(
+                    f"contact_failed:{code}",
+                    sender_id,
+                    "[Feishu] Sender name lookup failed for %s via contact API: [%s] %s",
+                    sender_id,
+                    code,
+                    msg,
+                )
+                return None
+            name = self._contact_display_name(response)
+            if name:
+                self._sender_name_cache[sender_id] = (name, now + _FEISHU_SENDER_NAME_TTL_SECONDS)
+                return name
+            self._log_sender_name_warning_once(
+                "contact_empty_name",
+                sender_id,
+                "[Feishu] Sender name lookup returned no usable name for %s via contact API",
+                sender_id,
+            )
         except Exception:
-            logger.debug("[Feishu] Failed to resolve sender name for %s", sender_id, exc_info=True)
+            self._log_sender_name_warning_once(
+                "contact_exception",
+                sender_id,
+                "[Feishu] Failed to resolve sender name for %s",
+                sender_id,
+                exc_info=True,
+            )
+        return None
+
+    @staticmethod
+    def _contact_user_id_type(sender_id: str) -> str:
+        if sender_id.startswith("ou_"):
+            return "open_id"
+        if sender_id.startswith("on_"):
+            return "union_id"
+        return "user_id"
+
+    @staticmethod
+    def _contact_display_name(response: Any) -> Optional[str]:
+        user = getattr(getattr(response, "data", None), "user", None)
+        for field_name in ("name", "display_name", "nickname", "en_name"):
+            value = getattr(user, field_name, None)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
         return None
 
     async def _fetch_bot_names(self, bot_ids: List[str]) -> Optional[Dict[str, str]]:
@@ -4070,18 +4135,51 @@ class FeishuAdapter(BasePlatformAdapter):
             resp = await asyncio.to_thread(self._client.request, req)
             content = getattr(getattr(resp, "raw", None), "content", None)
             if not content:
+                for bot_id in bot_ids:
+                    self._log_sender_name_warning_once(
+                        "bot_no_response",
+                        bot_id,
+                        "[Feishu] Bot name lookup returned no response content for %s",
+                        bot_id,
+                    )
                 return None
             payload = json.loads(content)
             if payload.get("code") != 0:
+                code = payload.get("code", "unknown")
+                msg = payload.get("msg", "unknown")
+                for bot_id in bot_ids:
+                    self._log_sender_name_warning_once(
+                        f"bot_failed:{code}",
+                        bot_id,
+                        "[Feishu] Bot name lookup failed for %s: [%s] %s",
+                        bot_id,
+                        code,
+                        msg,
+                    )
                 return None
             bots = (payload.get("data") or {}).get("bots") or {}
+            for bot_id in bot_ids:
+                if bot_id not in bots:
+                    self._log_sender_name_warning_once(
+                        "bot_missing",
+                        bot_id,
+                        "[Feishu] Bot name lookup response did not include requested bot %s",
+                        bot_id,
+                    )
             return {
                 oid: str(info.get("name") or "").strip()
                 for oid, info in bots.items()
                 if oid
             }
         except Exception:
-            logger.debug("[Feishu] Failed to fetch bot names for %s", bot_ids, exc_info=True)
+            for bot_id in bot_ids:
+                self._log_sender_name_warning_once(
+                    "bot_exception",
+                    bot_id,
+                    "[Feishu] Failed to fetch bot name for %s",
+                    bot_id,
+                    exc_info=True,
+                )
             return None
 
     async def _fetch_message_text(self, message_id: str) -> Optional[str]:
