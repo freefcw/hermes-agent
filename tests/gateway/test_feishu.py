@@ -592,11 +592,13 @@ class TestAdapterModule(unittest.TestCase):
             {
                 "ws_ping_interval": 10,
                 "ws_ping_timeout": 8,
+                "ws_recycle_interval_seconds": 600,
             }
         )
 
         self.assertEqual(settings.ws_ping_interval, 10)
         self.assertEqual(settings.ws_ping_timeout, 8)
+        self.assertEqual(settings.ws_recycle_interval_seconds, 600)
 
     def test_load_settings_uses_health_check_defaults_for_invalid_ws_ping_values(self):
         from gateway.platforms.feishu import FeishuAdapter
@@ -605,11 +607,13 @@ class TestAdapterModule(unittest.TestCase):
             {
                 "ws_ping_interval": 0,
                 "ws_ping_timeout": -1,
+                "ws_recycle_interval_seconds": 30,
             }
         )
 
         self.assertEqual(settings.ws_ping_interval, 30)
         self.assertEqual(settings.ws_ping_timeout, 10)
+        self.assertIsNone(settings.ws_recycle_interval_seconds)
 
     def test_load_settings_allows_null_ws_ping_values_for_sdk_defaults(self):
         from gateway.platforms.feishu import FeishuAdapter
@@ -618,11 +622,13 @@ class TestAdapterModule(unittest.TestCase):
             {
                 "ws_ping_interval": None,
                 "ws_ping_timeout": None,
+                "ws_recycle_interval_seconds": None,
             }
         )
 
         self.assertIsNone(settings.ws_ping_interval)
         self.assertIsNone(settings.ws_ping_timeout)
+        self.assertIsNone(settings.ws_recycle_interval_seconds)
 
     def test_runtime_ws_overrides_reapply_after_sdk_configure(self):
         import sys
@@ -826,7 +832,7 @@ class TestFeishuWSWatchdog(unittest.TestCase):
             adapter._disable_websocket_auto_reconnect = Mock()
             adapter._connect_with_retry = AsyncMock()
             adapter._on_ws_reconnecting = Mock()
-            adapter._on_ws_reconnected = Mock()
+            adapter._on_ws_client_restarted = Mock()
             adapter._mark_connected = Mock()
 
             adapter._handle_ws_thread_done(future)
@@ -839,7 +845,7 @@ class TestFeishuWSWatchdog(unittest.TestCase):
         adapter._disable_websocket_auto_reconnect.assert_called_once()
         adapter._connect_with_retry.assert_awaited_once()
         adapter._on_ws_reconnecting.assert_called_once()
-        adapter._on_ws_reconnected.assert_called_once()
+        adapter._on_ws_client_restarted.assert_called_once()
         adapter._mark_connected.assert_called_once()
 
     @patch.dict(os.environ, {}, clear=True)
@@ -882,6 +888,46 @@ class TestFeishuWSWatchdog(unittest.TestCase):
         loop.run_until_complete(self._run_watchdog_briefly(adapter))
         loop.close()
 
+        adapter._connect_with_retry.assert_not_called()
+        adapter._disable_websocket_auto_reconnect.assert_not_called()
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_watchdog_recycles_aged_ws_connection(self):
+        """Watchdog should proactively stop aged websocket threads when configured."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"ws_recycle_interval_seconds": 60}))
+        adapter._running = True
+        adapter._connection_mode = "websocket"
+        adapter._ws_started_at = time.time() - 120
+
+        loop = asyncio.new_event_loop()
+        future = loop.create_future()
+        adapter._ws_future = future
+
+        class _ThreadLoop:
+            stopped = False
+
+            def is_closed(self):
+                return False
+
+            def call_soon_threadsafe(self, callback, *args):
+                callback(*args)
+
+            def stop(self):
+                self.stopped = True
+
+        thread_loop = _ThreadLoop()
+        adapter._ws_thread_loop = thread_loop
+        adapter._connect_with_retry = AsyncMock()
+        adapter._disable_websocket_auto_reconnect = Mock()
+
+        loop.run_until_complete(self._run_watchdog_briefly(adapter))
+        loop.close()
+
+        self.assertTrue(thread_loop.stopped)
+        self.assertEqual(adapter._ws_thread_stop_reason, "scheduled recycle after 60s")
         adapter._connect_with_retry.assert_not_called()
         adapter._disable_websocket_auto_reconnect.assert_not_called()
 
@@ -1003,6 +1049,60 @@ class TestFeishuWSWatchdog(unittest.TestCase):
                 mock_logger.error.assert_called_once()
                 args = mock_logger.error.call_args
                 self.assertIn("WS client exited with error", args[0][0])
+        finally:
+            sys.modules.clear()
+            sys.modules.update(original_modules)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_expected_ws_loop_stop_is_not_logged_as_error(self):
+        """Requested loop stops should not be reported as unexpected client errors."""
+        import sys
+        from types import ModuleType
+
+        class _FakeWSClient:
+            _reconnect_nonce = 30
+            _reconnect_interval = 120
+            _ping_interval = 120
+
+            def _configure(self, conf):
+                pass
+
+            def start(self):
+                raise RuntimeError("Event loop stopped before Future completed.")
+
+        fake_client = _FakeWSClient()
+        fake_adapter = SimpleNamespace(
+            _ws_thread_loop=None,
+            _ws_thread_stop_reason="scheduled recycle after 60s",
+            _ws_reconnect_nonce=30,
+            _ws_reconnect_interval=120,
+            _ws_ping_interval=None,
+            _ws_ping_timeout=None,
+            _running=True,
+        )
+        fake_client_module = ModuleType("lark_oapi.ws.client")
+        fake_client_module.loop = None
+        fake_client_module.websockets = SimpleNamespace(connect=AsyncMock())
+        fake_ws_module = ModuleType("lark_oapi.ws")
+        fake_ws_module.client = fake_client_module
+        fake_root_module = ModuleType("lark_oapi")
+        fake_root_module.ws = fake_ws_module
+
+        original_modules = sys.modules.copy()
+        sys.modules["lark_oapi"] = fake_root_module
+        sys.modules["lark_oapi.ws"] = fake_ws_module
+        sys.modules["lark_oapi.ws.client"] = fake_client_module
+        try:
+            from gateway.platforms.feishu import _run_official_feishu_ws_client
+
+            with patch("gateway.platforms.feishu.logger") as mock_logger:
+                with self.assertRaises(RuntimeError):
+                    _run_official_feishu_ws_client(fake_client, fake_adapter)
+                mock_logger.error.assert_not_called()
+                mock_logger.warning.assert_any_call(
+                    "[Feishu] WS client stopped for %s",
+                    "scheduled recycle after 60s",
+                )
         finally:
             sys.modules.clear()
             sys.modules.update(original_modules)

@@ -202,6 +202,8 @@ _DEFAULT_WEBHOOK_PORT = 8765
 _DEFAULT_WEBHOOK_PATH = "/feishu/webhook"
 _DEFAULT_WS_PING_INTERVAL = 30
 _DEFAULT_WS_PING_TIMEOUT = 10
+_DEFAULT_WS_RECYCLE_INTERVAL_SECONDS: Optional[int] = None
+_WS_EXPECTED_LOOP_STOP = "Event loop stopped before Future completed."
 # ---------------------------------------------------------------------------
 # TTL, rate-limit and webhook security constants
 # ---------------------------------------------------------------------------
@@ -392,6 +394,7 @@ class FeishuAdapterSettings:
     ws_reconnect_interval: int = 120
     ws_ping_interval: Optional[int] = _DEFAULT_WS_PING_INTERVAL
     ws_ping_timeout: Optional[int] = _DEFAULT_WS_PING_TIMEOUT
+    ws_recycle_interval_seconds: Optional[int] = _DEFAULT_WS_RECYCLE_INTERVAL_SECONDS
     admins: frozenset[str] = frozenset()
     default_group_policy: str = ""
     group_rules: Dict[str, FeishuGroupRule] = field(default_factory=dict)
@@ -555,6 +558,10 @@ def _coerce_optional_extra_int(
     if key in extra and extra[key] is None:
         return None
     return _coerce_int(extra.get(key), default=default, min_value=min_value)
+
+
+def _is_expected_ws_loop_stop(exc: BaseException) -> bool:
+    return isinstance(exc, RuntimeError) and _WS_EXPECTED_LOOP_STOP in str(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1318,6 +1325,7 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
         except Exception as exc:
             adapter._on_ws_receive_loop_failed(exc)
             if not loop.is_closed():
+                setattr(adapter, "_ws_thread_stop_reason", "receive loop failure")
                 loop.call_soon(loop.stop)
             return None
 
@@ -1353,7 +1361,10 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
     try:
         ws_client.start()
     except Exception as exc:
-        if getattr(adapter, "_running", False):
+        stop_reason = getattr(adapter, "_ws_thread_stop_reason", None)
+        if stop_reason and _is_expected_ws_loop_stop(exc):
+            logger.warning("[Feishu] WS client stopped for %s", stop_reason)
+        elif getattr(adapter, "_running", False):
             logger.error("[Feishu] WS client exited with error: %s", exc, exc_info=True)
         else:
             logger.debug("[Feishu] WS client exited during shutdown/startup: %s", exc, exc_info=True)
@@ -1476,6 +1487,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_watchdog_task: Optional[asyncio.Task] = None
         self._ws_restart_task: Optional[asyncio.Task] = None
         self._ws_thread_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._ws_started_at: Optional[float] = None
+        self._ws_thread_stop_reason: Optional[str] = None
         self._ws_observer_lock = threading.Lock()
         self._ws_reconnecting_count = 0
         self._ws_reconnected_count = 0
@@ -1628,6 +1641,12 @@ class FeishuAdapter(BasePlatformAdapter):
                 default=_DEFAULT_WS_PING_TIMEOUT,
                 min_value=1,
             ),
+            ws_recycle_interval_seconds=_coerce_optional_extra_int(
+                extra,
+                "ws_recycle_interval_seconds",
+                default=_DEFAULT_WS_RECYCLE_INTERVAL_SECONDS,
+                min_value=60,
+            ),
             admins=admins,
             default_group_policy=default_group_policy,
             group_rules=group_rules,
@@ -1665,6 +1684,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_reconnect_interval = settings.ws_reconnect_interval
         self._ws_ping_interval = settings.ws_ping_interval
         self._ws_ping_timeout = settings.ws_ping_timeout
+        self._ws_recycle_interval_seconds = settings.ws_recycle_interval_seconds
         self._allow_bots = settings.allow_bots
         self._require_mention = settings.require_mention
 
@@ -1795,6 +1815,8 @@ class FeishuAdapter(BasePlatformAdapter):
 
         self._ws_future = None
         self._ws_thread_loop = None
+        self._ws_started_at = None
+        self._ws_thread_stop_reason = None
         self._loop = None
         self._event_handler = None
         self._persist_seen_message_ids()
@@ -1825,6 +1847,7 @@ class FeishuAdapter(BasePlatformAdapter):
             pass
         finally:
             self._ws_client = None
+            self._ws_started_at = None
 
     def _install_ws_observer_hooks(self, ws_client: Any) -> None:
         if not hasattr(ws_client, "on_reconnecting") or not hasattr(ws_client, "on_reconnected"):
@@ -1850,6 +1873,12 @@ class FeishuAdapter(BasePlatformAdapter):
         )
 
     def _on_ws_reconnected(self, *_args: Any, **_kwargs: Any) -> None:
+        self._record_ws_connected_status("Websocket reconnected")
+
+    def _on_ws_client_restarted(self) -> None:
+        self._record_ws_connected_status("Websocket client restarted")
+
+    def _record_ws_connected_status(self, log_label: str) -> None:
         now = time.time()
         with self._ws_observer_lock:
             self._ws_reconnected_count += 1
@@ -1858,9 +1887,9 @@ class FeishuAdapter(BasePlatformAdapter):
             started_at = self._ws_last_reconnecting_at
         duration = None if started_at is None else max(0.0, now - started_at)
         if duration is None:
-            logger.info("[Feishu] Websocket reconnected (count=%d)", count)
+            logger.info("[Feishu] %s (count=%d)", log_label, count)
         else:
-            logger.info("[Feishu] Websocket reconnected (count=%d, duration=%.2fs)", count, duration)
+            logger.info("[Feishu] %s (count=%d, duration=%.2fs)", log_label, count, duration)
         self._write_runtime_status_safe(
             "ws_reconnected",
             platform_state="connected",
@@ -1870,6 +1899,29 @@ class FeishuAdapter(BasePlatformAdapter):
 
     def _on_ws_receive_loop_failed(self, exc: BaseException) -> None:
         logger.warning("[Feishu] Websocket receive loop failed; rebuilding client: %s", exc)
+
+    def _request_ws_thread_stop(self, reason: str) -> bool:
+        ws_thread_loop = self._ws_thread_loop
+        if ws_thread_loop is None or ws_thread_loop.is_closed():
+            return False
+        if self._ws_thread_stop_reason is not None:
+            return False
+        self._ws_thread_stop_reason = reason
+        logger.warning("[Feishu] Requesting websocket thread stop (%s)", reason)
+        ws_thread_loop.call_soon_threadsafe(ws_thread_loop.stop)
+        return True
+
+    def _should_recycle_ws_connection(self) -> bool:
+        interval = self._ws_recycle_interval_seconds
+        if interval is None:
+            return False
+        if self._ws_future is None or self._ws_future.done():
+            return False
+        restart_task = self._ws_restart_task
+        if restart_task is not None and not restart_task.done():
+            return False
+        started_at = self._ws_started_at
+        return started_at is not None and (time.time() - started_at) >= interval
 
     def _schedule_ws_restart_from_done(self, exited_future: asyncio.Future) -> None:
         if not self._running or self._connection_mode != "websocket":
@@ -1908,7 +1960,7 @@ class FeishuAdapter(BasePlatformAdapter):
             self._disable_websocket_auto_reconnect()
             self._ws_future = None
             await self._connect_with_retry()
-            self._on_ws_reconnected()
+            self._on_ws_client_restarted()
             self._mark_connected()
             return True
         except Exception:
@@ -1922,7 +1974,10 @@ class FeishuAdapter(BasePlatformAdapter):
         if fut.cancelled():
             return
         exc = fut.exception()
-        if exc:
+        stop_reason = self._ws_thread_stop_reason
+        if exc and stop_reason and _is_expected_ws_loop_stop(exc):
+            logger.warning("[Feishu] WS thread stopped for %s", stop_reason)
+        elif exc:
             if self._running:
                 logger.error("[Feishu] WS thread failed: %s", exc)
             else:
@@ -1932,6 +1987,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 logger.warning("[Feishu] WS thread exited unexpectedly")
             else:
                 logger.debug("[Feishu] WS thread exited during shutdown/startup")
+        self._ws_thread_stop_reason = None
         self._schedule_ws_restart_from_done(fut)
 
     async def _run_ws_watchdog(self) -> None:
@@ -1942,6 +1998,11 @@ class FeishuAdapter(BasePlatformAdapter):
                 break
             if self._connection_mode != "websocket":
                 continue
+            if self._should_recycle_ws_connection():
+                interval = self._ws_recycle_interval_seconds
+                reason = f"scheduled recycle after {interval}s"
+                if self._request_ws_thread_stop(reason):
+                    continue
             if self._ws_future is not None and self._ws_future.done():
                 restart_task = self._ws_restart_task
                 if restart_task is not None and not restart_task.done():
@@ -4875,7 +4936,14 @@ class FeishuAdapter(BasePlatformAdapter):
             self._ws_client,
             self,
         )
+        self._ws_started_at = time.time()
         self._ws_future.add_done_callback(self._handle_ws_thread_done)
+        logger.info(
+            "[Feishu] WS client started (ping_interval=%s, ping_timeout=%s, recycle_interval=%s)",
+            self._ws_ping_interval,
+            self._ws_ping_timeout,
+            self._ws_recycle_interval_seconds,
+        )
         await self._raise_if_ws_thread_exited_during_startup()
 
     async def _raise_if_ws_thread_exited_during_startup(self) -> None:
