@@ -1486,6 +1486,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_future: Optional[asyncio.Future] = None
         self._ws_watchdog_task: Optional[asyncio.Task] = None
         self._ws_restart_task: Optional[asyncio.Task] = None
+        self._ws_recycle_task: Optional[asyncio.Task] = None
         self._ws_thread_loop: Optional[asyncio.AbstractEventLoop] = None
         self._ws_started_at: Optional[float] = None
         self._ws_thread_stop_reason: Optional[str] = None
@@ -1781,6 +1782,11 @@ class FeishuAdapter(BasePlatformAdapter):
             self._ws_restart_task = None
             restart_task.cancel()
             await asyncio.gather(restart_task, return_exceptions=True)
+        if self._ws_recycle_task is not None:
+            recycle_task = self._ws_recycle_task
+            self._ws_recycle_task = None
+            recycle_task.cancel()
+            await asyncio.gather(recycle_task, return_exceptions=True)
         await self._cancel_pending_tasks(self._pending_text_batch_tasks)
         await self._cancel_pending_tasks(self._pending_media_batch_tasks)
         self._reset_batch_buffers()
@@ -1846,6 +1852,7 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception:
             pass
         finally:
+            self._cancel_ws_recycle_timer()
             self._ws_client = None
             self._ws_started_at = None
 
@@ -1911,17 +1918,43 @@ class FeishuAdapter(BasePlatformAdapter):
         ws_thread_loop.call_soon_threadsafe(ws_thread_loop.stop)
         return True
 
-    def _should_recycle_ws_connection(self) -> bool:
+    def _schedule_ws_recycle_timer(self, ws_future: asyncio.Future) -> None:
+        self._cancel_ws_recycle_timer()
         interval = self._ws_recycle_interval_seconds
         if interval is None:
-            return False
-        if self._ws_future is None or self._ws_future.done():
-            return False
+            return
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        self._ws_recycle_task = loop.create_task(self._run_ws_recycle_timer(ws_future, interval))
+        self._ws_recycle_task.add_done_callback(self._clear_ws_recycle_task)
+
+    def _cancel_ws_recycle_timer(self) -> None:
+        recycle_task = self._ws_recycle_task
+        self._ws_recycle_task = None
+        if recycle_task is not None and not recycle_task.done():
+            recycle_task.cancel()
+
+    def _clear_ws_recycle_task(self, task: asyncio.Task) -> None:
+        if self._ws_recycle_task is task:
+            self._ws_recycle_task = None
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.error("[Feishu] WS recycle timer failed unexpectedly", exc_info=True)
+
+    async def _run_ws_recycle_timer(self, ws_future: asyncio.Future, interval: float) -> None:
+        await asyncio.sleep(interval)
+        if not self._running or self._connection_mode != "websocket":
+            return
+        if self._ws_future is not ws_future or ws_future.done():
+            return
         restart_task = self._ws_restart_task
         if restart_task is not None and not restart_task.done():
-            return False
-        started_at = self._ws_started_at
-        return started_at is not None and (time.time() - started_at) >= interval
+            return
+        self._request_ws_thread_stop(f"scheduled recycle after {interval:g}s")
 
     def _schedule_ws_restart_from_done(self, exited_future: asyncio.Future) -> None:
         if not self._running or self._connection_mode != "websocket":
@@ -1987,6 +2020,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 logger.warning("[Feishu] WS thread exited unexpectedly")
             else:
                 logger.debug("[Feishu] WS thread exited during shutdown/startup")
+        self._cancel_ws_recycle_timer()
         self._ws_thread_stop_reason = None
         self._schedule_ws_restart_from_done(fut)
 
@@ -1998,11 +2032,6 @@ class FeishuAdapter(BasePlatformAdapter):
                 break
             if self._connection_mode != "websocket":
                 continue
-            if self._should_recycle_ws_connection():
-                interval = self._ws_recycle_interval_seconds
-                reason = f"scheduled recycle after {interval}s"
-                if self._request_ws_thread_stop(reason):
-                    continue
             if self._ws_future is not None and self._ws_future.done():
                 restart_task = self._ws_restart_task
                 if restart_task is not None and not restart_task.done():
@@ -4938,6 +4967,7 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         self._ws_started_at = time.time()
         self._ws_future.add_done_callback(self._handle_ws_thread_done)
+        self._schedule_ws_recycle_timer(self._ws_future)
         logger.info(
             "[Feishu] WS client started (ping_interval=%s, ping_timeout=%s, recycle_interval=%s)",
             self._ws_ping_interval,

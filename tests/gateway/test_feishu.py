@@ -290,6 +290,55 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         "FEISHU_APP_ID": "cli_app",
         "FEISHU_APP_SECRET": "secret_app",
     }, clear=True)
+    def test_connect_websocket_schedules_recycle_timer_when_configured(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"ws_recycle_interval_seconds": 600}))
+        ws_client = SimpleNamespace()
+
+        async def _run():
+            real_loop = asyncio.get_running_loop()
+            future = real_loop.create_future()
+
+            class _Loop:
+                def run_in_executor(self, *_args, **_kwargs):
+                    return future
+
+                def create_task(self, coro):
+                    return real_loop.create_task(coro)
+
+                def is_closed(self):
+                    return False
+
+            adapter._loop = _Loop()
+            with (
+                patch("gateway.platforms.feishu.FEISHU_WEBSOCKET_AVAILABLE", True),
+                patch(
+                    "gateway.platforms.feishu.lark",
+                    SimpleNamespace(LogLevel=SimpleNamespace(INFO="INFO", WARNING="WARNING")),
+                ),
+                patch("gateway.platforms.feishu.EventDispatcherHandler") as mock_handler_class,
+                patch("gateway.platforms.feishu.FeishuWSClient", return_value=ws_client),
+                patch.object(adapter, "_hydrate_bot_identity", new=AsyncMock()),
+                patch.object(adapter, "_build_lark_client", return_value=SimpleNamespace()),
+                patch.object(adapter, "_raise_if_ws_thread_exited_during_startup", new=AsyncMock()),
+            ):
+                _mock_event_dispatcher_builder(mock_handler_class)
+                await adapter._connect_websocket()
+
+            recycle_task = adapter._ws_recycle_task
+            self.assertIsNotNone(recycle_task)
+            self.assertFalse(recycle_task.done())
+            adapter._cancel_ws_recycle_timer()
+            await asyncio.gather(recycle_task, return_exceptions=True)
+
+        asyncio.run(_run())
+
+    @patch.dict(os.environ, {
+        "FEISHU_APP_ID": "cli_app",
+        "FEISHU_APP_SECRET": "secret_app",
+    }, clear=True)
     def test_connect_rejects_existing_app_lock(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
@@ -892,19 +941,14 @@ class TestFeishuWSWatchdog(unittest.TestCase):
         adapter._disable_websocket_auto_reconnect.assert_not_called()
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_watchdog_recycles_aged_ws_connection(self):
-        """Watchdog should proactively stop aged websocket threads when configured."""
+    def test_recycle_timer_stops_current_ws_connection(self):
+        """Recycle timer should proactively stop the websocket thread when configured."""
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig(extra={"ws_recycle_interval_seconds": 60}))
         adapter._running = True
         adapter._connection_mode = "websocket"
-        adapter._ws_started_at = time.time() - 120
-
-        loop = asyncio.new_event_loop()
-        future = loop.create_future()
-        adapter._ws_future = future
 
         class _ThreadLoop:
             stopped = False
@@ -923,11 +967,24 @@ class TestFeishuWSWatchdog(unittest.TestCase):
         adapter._connect_with_retry = AsyncMock()
         adapter._disable_websocket_auto_reconnect = Mock()
 
-        loop.run_until_complete(self._run_watchdog_briefly(adapter))
-        loop.close()
+        async def _run():
+            loop = asyncio.get_running_loop()
+            future = loop.create_future()
+            adapter._loop = loop
+            adapter._ws_future = future
+            adapter._ws_recycle_interval_seconds = 0
+
+            adapter._schedule_ws_recycle_timer(future)
+            task = adapter._ws_recycle_task
+            self.assertIsNotNone(task)
+            await task
+            await asyncio.sleep(0)
+
+        asyncio.run(_run())
 
         self.assertTrue(thread_loop.stopped)
-        self.assertEqual(adapter._ws_thread_stop_reason, "scheduled recycle after 60s")
+        self.assertEqual(adapter._ws_thread_stop_reason, "scheduled recycle after 0s")
+        self.assertIsNone(adapter._ws_recycle_task)
         adapter._connect_with_retry.assert_not_called()
         adapter._disable_websocket_auto_reconnect.assert_not_called()
 
